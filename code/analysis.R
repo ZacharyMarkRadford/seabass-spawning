@@ -286,6 +286,8 @@ observed_spawning_dist |>
 #   - That is left-*truncation* (not censoring): missing values are absent, not recorded as "< L".
 #   - The MLE adjusts for truncation via the factor P(S >= L) = 1 - Phi((L - mu)/sd).
 
+# TODO: Check the fit_truncnorm_mle actually is fitting the lower sampling probability from the whole of Wales
+
 fit_truncnorm_mle <- function(
   S_obs,
   L,
@@ -412,10 +414,6 @@ ggplot(hist_data, aes(x = day_of_year, y = prob, colour = method)) +
 
 # Start with mean of means
 # Look at tiem between fiorst settlement we haev recorded and sampling dat
-
-fits_B |>
-  ggplot(aes(x = ))
-
 
 welsh_cf_overall <- fits_B |>
   mutate(
