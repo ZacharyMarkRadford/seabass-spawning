@@ -3,7 +3,11 @@
     "allow": [
       "Bash(Rscript -e \"source\\(here::here\\('code', 'anaysisV2.R'\\)\\)\")",
       "Bash(Rscript -e ':*)",
-      "Bash(grep -v \"^$\")"
+      "Bash(grep -v \"^$\")",
+      "Bash(Rscript -e \"suppressMessages\\(suppressWarnings\\(source\\(here::here\\('code', 'anaysisV2.R'\\)\\)\\)\\)\")",
+      "Bash(grep -Ev \"^\\(Attaching|Conflicts|The following|✔|✖|ℹ|──|chr|dbl|Delimiter|Rows:|here\\\\\\(\\\\\\)|$\\)\")",
+      "Bash(sed -i 's/corrected_M3 = \"#009E73\"/corrected_M2_1 = \"#CC79A7\"/' code/anaysisV2.R)",
+      "Bash(sed -i 's/Three correction methods vs. raw mean spawn date \\(Wales\\)/Correction methods vs. raw mean spawn date \\(Wales\\)/' code/anaysisV2.R)"
     ]
   }
 }
