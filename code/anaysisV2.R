@@ -258,7 +258,10 @@ fits_m2 <- welsh_data |>
       # Per-survey diagnostic: use observed minimum as L so it is always
       # below every observation in this sample.
       L <- min(S_obs, na.rm = TRUE) - 0.5
-      # L <- 10
+      # L CHANGER
+      # If you wanjt to apply a global L, comment out line above and uncomment line below
+      # Large L = more correction, smaller L = less correction
+      # L <- 87
       fit <- fit_truncnorm_mle(
         S_obs,
         L = L,
@@ -322,6 +325,10 @@ method2_results <- spawning_data |>
     survey_day = lubridate::yday(survey_date),
     # Data-driven L: observed minimum for this survey, shifted just below it
     L = min(spawn_date_julian, na.rm = TRUE) - 0.5,
+    # L CHANGER
+    # If you wanjt to apply a global L, comment out line above and uncomment line below
+    # Large L = more correction, smaller L = less correction
+    # L <- 87
     alpha = (L - mu_wales) / sd_wales,
     p_obs = 1 - pnorm(alpha), # P(S ≥ L | Wales distribution)
     CF_M2 = 1 / p_obs,
@@ -338,59 +345,109 @@ method2_results <- spawning_data |>
   )
 
 
-# ── Method 3: Wales-reference CDF lookup ────────────────────────────────
-# Conceptually the same as Method 2, but the distinction is in *where the
-# reference parameters come from*:
+# ── Method 2.1: Combined true spawning distribution from per-survey MLE ─────
+# Method 2 only corrects the *mean* of each survey sample.  Method 2.1 goes
+# further: it runs the truncated-Normal MLE for every survey date across ALL
+# countries to estimate the full true (mu_hat, sd_hat) for that survey, then
+# combines the per-survey distributions into a single country-level spawning
+# distribution as a mixture of Normals weighted by sample size.
 #
-#   Method 2 — per-survey MLE (fits_m2) used to derive reference; applied with
-#              the pooled Wales mu/sd
-#   Method 3 — Wales parameters are fixed directly from the pooled sample;
-#              CF is read off the CDF with no per-sample optimisation at all
-#
-# Both converge to the same formula when we use (mu_wales, sd_wales) as
-# reference — they differ if you substitute the MLE-fitted (mu_ref, sd_ref)
-# from fits_m2 (see commented-out variant below).
-#
-# This IS the "optimising CDFs" approach: fit Normal CDF to Wales ECDF once,
-# then evaluate the CDF at L(survey) to get CF for any survey date worldwide.
+# Why this is useful:
+#   - It recovers a full distribution, not just a corrected mean
+#   - Different surveys cover different parts of the spawning season, so
+#     combining them weights each part of the season by how many fish it
+#     contributed
+#   - The mixture can be asymmetric or multi-modal in ways a simple mean hides
 
-method3_results <- method2_results |>
-  rename(CF_M3 = CF_M2, mean_spawn_corrected_M3 = mean_spawn_corrected) |>
-  select(
-    country,
-    survey_date,
-    survey_day,
-    n,
-    L,
-    CF_M3,
-    mean_spawn_raw,
-    mean_spawn_corrected = mean_spawn_corrected_M3
-  )
+# Step 1: fit truncated Normal per survey date for every country (≥ 3 fish)
+fits_m2_all <- spawning_data |>
+  group_by(country, survey_date) |>
+  filter(n() >= 3) |>
+  group_modify(
+    ~ {
+      S_obs <- .x$spawn_date_julian
+      L <- min(S_obs, na.rm = TRUE) - 0.5
+      fit <- fit_truncnorm_mle(S_obs, L = L, init_sd = sd(S_obs, na.rm = TRUE))
+      tibble(
+        survey_day = lubridate::yday(.y$survey_date),
+        n = length(S_obs),
+        L = L,
+        mu_hat = fit$mu,
+        sd_hat = fit$sd,
+        converged = fit$converged
+      )
+    }
+  ) |>
+  ungroup()
 
-# -- Optional variant: use the MLE-pooled (mu_ref, sd_ref) instead of raw Wales --
-# mu_ref <- weighted.mean(fits_m2$mu_hat, w = fits_m2$n)
-# sd_ref <- weighted.mean(fits_m2$sd_hat, w = fits_m2$n)
-# Then replace mu_wales / sd_wales in the alpha / mean_trunc formulas above.
+# Step 2: evaluate the mixture density over a spawn-date grid for each country.
+# Each survey contributes dnorm(x, mu_hat, sd_hat) weighted by n / n_country_total.
+# Using outer() for a vectorised calculation — no loops.
 
-# Note: Methods 2 and 3 produce identical corrections in the implementation
-# above (both use mu_wales, sd_wales with L = observed minimum).  To see the
-# difference, un-comment the variant above and rerun method3_results with
-# mu_ref / sd_ref — useful if you suspect the raw Wales mean is itself biased.
+spawn_grid <- seq(-50, 250, by = 1)
 
-# ── CF as a function of survey date ─────────────────────────────────────
-# Show how the correction factor grows with survey date — later surveys need
-# larger corrections because more early-spawned fish have died.
+mixture_density_m2_1 <- fits_m2_all |>
+  group_by(country) |>
+  group_modify(
+    ~ {
+      w <- .x$n / sum(.x$n)
+      # density_matrix rows = spawn_grid values, columns = survey components
+      density_matrix <- outer(
+        spawn_grid,
+        seq_along(.x$mu_hat),
+        function(d, j) dnorm(d, mean = .x$mu_hat[j], sd = .x$sd_hat[j])
+      )
+      tibble(
+        spawn_date_julian = spawn_grid,
+        density = as.vector(density_matrix %*% w)
+      )
+    }
+  ) |>
+  ungroup()
 
-method3_results |>
-  distinct(survey_day, CF_M3, country) |>
-  ggplot(aes(x = survey_day, y = CF_M3, colour = country)) +
-  geom_point() +
-  geom_line() +
+# Step 3: derive mean and sd of each country's mixture distribution.
+# Mixture mean  = weighted mean of component means
+# Mixture var   = weighted mean of (sigma_i^2 + mu_i^2) − (mixture mean)^2
+#                 (law of total variance)
+
+mixture_summary_m2_1 <- fits_m2_all |>
+  group_by(country) |>
+  summarise(
+    n_surveys = n(),
+    n_total = sum(n),
+    mean_M2_1 = weighted.mean(mu_hat, w = n),
+    var_M2_1 = weighted.mean(sd_hat^2 + mu_hat^2, w = n) -
+      weighted.mean(mu_hat, w = n)^2,
+    .groups = "drop"
+  ) |>
+  mutate(sd_M2_1 = sqrt(var_M2_1))
+
+print(mixture_summary_m2_1)
+
+# Plot: overlay corrected distributions for all countries plus the raw Wales
+# reference, so differences in spawning timing become visually apparent
+raw_wales_ref <- tibble(
+  spawn_date_julian = spawn_grid,
+  density = dnorm(spawn_grid, mean = mu_wales, sd = sd_wales),
+  country = "Wales (raw reference)"
+)
+
+mixture_density_m2_1 |>
+  bind_rows(raw_wales_ref) |>
+  ggplot(aes(x = spawn_date_julian, y = density, colour = country)) +
+  geom_line(linewidth = 0.9) +
+  geom_vline(
+    data = mixture_summary_m2_1,
+    aes(xintercept = mean_M2_1, colour = country),
+    linetype = "dashed",
+    linewidth = 0.5
+  ) +
   labs(
-    title = "Correction factor (CF) grows with survey date",
-    subtitle = "CF = 1 / P(S ≥ L | Wales distribution);  L = observed min spawn date per survey",
-    x = "Survey day of year",
-    y = "Correction factor (CF)"
+    title = "Method 2.1: corrected spawning distribution per country",
+    subtitle = "Mixture of per-survey truncated-Normal fits; dashed = mixture mean",
+    x = "Spawn date (Julian day of year)",
+    y = "Probability density",
+    colour = "Country"
   ) +
   theme_classic(base_size = 14)
 
@@ -424,12 +481,7 @@ summary_by_country <- spawning_data |>
     by = "country"
   ) |>
   left_join(
-    method3_results |>
-      group_by(country) |>
-      summarise(
-        mean_M3 = weighted.mean(mean_spawn_corrected, w = n),
-        .groups = "drop"
-      ),
+    mixture_summary_m2_1 |> select(country, mean_M2_1),
     by = "country"
   )
 
@@ -452,16 +504,16 @@ comparison_wales <- method2_results |>
     by = "survey_date"
   ) |>
   left_join(
-    method3_results |>
+    fits_m2_all |>
       filter(country == "Wales") |>
-      select(survey_date, corrected_M3 = mean_spawn_corrected),
+      select(survey_date, corrected_M2_1 = mu_hat),
     by = "survey_date"
   )
 
-# Three-method comparison plot for Wales
+# Comparison plot for Wales (all methods)
 comparison_wales |>
   tidyr::pivot_longer(
-    c(mean_spawn_raw, corrected_M1, corrected_M2, corrected_M3),
+    c(mean_spawn_raw, corrected_M1, corrected_M2, corrected_M2_1),
     names_to = "method",
     values_to = "mean_spawn"
   ) |>
@@ -474,11 +526,11 @@ comparison_wales |>
       mean_spawn_raw = "grey50",
       corrected_M1 = "#E69F00",
       corrected_M2 = "#56B4E9",
-      corrected_M3 = "#009E73"
+      corrected_M2_1 = "#CC79A7"
     )
   ) +
   labs(
-    title = "Three correction methods vs. raw mean spawn date (Wales)",
+    title = "Correction methods vs. raw mean spawn date (Wales)",
     subtitle = "Dashed line = Wales pooled mean (target ≈ Julian day 125)",
     x = "Survey day of year",
     y = "Mean spawn date (Julian day)",
@@ -486,16 +538,58 @@ comparison_wales |>
   ) +
   theme_classic(base_size = 14)
 
-# Corrected mean spawn date per country (all methods)
-method3_results |>
-  ggplot(aes(x = survey_day, y = mean_spawn_corrected, colour = country)) +
-  geom_point(aes(size = n)) +
-  geom_smooth(method = "loess", se = FALSE) +
-  geom_hline(yintercept = mu_wales, linetype = "dashed") +
-  labs(
-    title = "Method 3 corrected mean spawn date by survey date (all countries)",
-    subtitle = "Dashed = Wales reference mean",
-    x = "Survey day of year",
-    y = "Corrected mean spawn date (Julian day)"
-  ) +
-  theme_classic(base_size = 14)
+
+# ── Overall combined mean spawn date (all countries except Belgium) ───────
+# Pool England, France, and Wales together and compute a single overall
+# corrected mean under each method, weighted by sample size.
+#
+# Method 1  : weighted mean of per-survey corrected means
+# Method 2  : weighted mean of per-survey corrected means
+# Method 2.1: mixture mean of all per-survey truncated-Normal fits
+#             (uses the same law-of-total-variance pooling as above, but
+#              now across countries rather than within a single country)
+
+overall_M1 <- method1_results |>
+  filter(country != "Belgium") |>
+  summarise(
+    n_total = sum(n),
+    overall_mean = weighted.mean(mean_spawn_corrected, w = n)
+  )
+
+overall_M2 <- method2_results |>
+  filter(country != "Belgium") |>
+  summarise(
+    n_total = sum(n),
+    overall_mean = weighted.mean(mean_spawn_corrected, w = n)
+  )
+
+overall_M2_1 <- fits_m2_all |>
+  filter(country != "Belgium") |>
+  summarise(
+    n_total = sum(n),
+    overall_mean = weighted.mean(mu_hat, w = n),
+    overall_var = weighted.mean(sd_hat^2 + mu_hat^2, w = n) -
+      weighted.mean(mu_hat, w = n)^2
+  ) |>
+  mutate(overall_sd = sqrt(overall_var))
+
+overall_summary <- tibble(
+  method = c("Raw (excl. Belgium)", "Method 1", "Method 2", "Method 2.1"),
+  n = c(
+    sum(spawning_data$country != "Belgium"),
+    overall_M1$n_total,
+    overall_M2$n_total,
+    overall_M2_1$n_total
+  ),
+  overall_mean = c(
+    mean(
+      spawning_data$spawn_date_julian[spawning_data$country != "Belgium"],
+      na.rm = TRUE
+    ),
+    overall_M1$overall_mean,
+    overall_M2$overall_mean,
+    overall_M2_1$overall_mean
+  )
+)
+
+print(overall_summary)
