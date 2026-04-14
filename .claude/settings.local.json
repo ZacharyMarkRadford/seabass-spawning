@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(Rscript -e \"source\\(here::here\\('code', 'anaysisV2.R'\\)\\)\")",
+      "Bash(Rscript -e ':*)",
+      "Bash(grep -v \"^$\")"
+    ]
+  }
+}
