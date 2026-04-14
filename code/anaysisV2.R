@@ -83,100 +83,6 @@ message(sprintf(
 ))
 
 
-# ── Method 1: Mortality-weighted mean ───────────────────────────────────
-# Each fish is upweighted by 1/survival so that early-spawned (more-depleted)
-# fish count more.  W = 1 / (Sp * Sn) where:
-#   Sp = exp(-Mp * pelagic_duration)   pelagic-phase survival
-#   Sn = exp(-Mn * nursery_duration)   nursery-phase survival
-#
-# Mp is fixed at the plaice prior (0.079).  Mn is *optimised per survey date*
-# on the Wales data so that the weighted mean matches the Wales pooled mean,
-# then applied to every survey date in the full dataset via a smooth model.
-
-Mp_fixed <- 0.079
-
-# Helper: find Mn that makes the mortality-weighted mean equal mu_true
-fit_Mn <- function(df_survey, mu_true, Mp = Mp_fixed, lower = 0, upper = 1) {
-  obj <- function(Mn) {
-    Sn <- exp(-Mn * df_survey$nursery_duration)
-    Sp <- exp(-Mp * df_survey$pelagic_duration)
-    W <- 1 / (Sp * Sn)
-    mu_hat <- weighted.mean(df_survey$spawn_date_julian, w = W, na.rm = TRUE)
-    (mu_hat - mu_true)^2
-  }
-  optimize(obj, interval = c(lower, upper))$minimum
-}
-
-# Apply per Wales survey date (≥ 3 fish)
-wales_mn_fits <- welsh_data |>
-  group_by(survey_date) |>
-  filter(n() >= 3) |>
-  group_modify(
-    ~ {
-      mn_hat <- fit_Mn(.x, mu_true = mu_wales)
-      tibble(
-        survey_day = lubridate::yday(.y$survey_date),
-        Mn_hat = mn_hat,
-        n = nrow(.x)
-      )
-    }
-  ) |>
-  ungroup()
-
-# Smooth Mn_hat over survey day so we can predict for any survey date
-# (including non-Wales countries).  A simple linear model on log(Mn) works
-# well for the range of data; adjust if the relationship looks non-linear.
-mn_model <- lm(log(Mn_hat) ~ survey_day, data = wales_mn_fits)
-
-# Convenience function: predicted Mn for a given survey day-of-year
-predict_Mn <- function(survey_day) {
-  exp(predict(mn_model, newdata = data.frame(survey_day = survey_day)))
-}
-
-# Compute corrected weighted mean per survey date for all countries
-method1_results <- spawning_data |>
-  mutate(survey_day = lubridate::yday(survey_date)) |>
-  group_by(country, survey_date, survey_day) |>
-  group_modify(
-    ~ {
-      Mn_use <- predict_Mn(.y$survey_day)
-      Sp <- exp(-Mp_fixed * .x$pelagic_duration)
-      Sn <- exp(-Mn_use * .x$nursery_duration)
-      W <- 1 / (Sp * Sn)
-      tibble(
-        n = nrow(.x),
-        Mn_used = Mn_use,
-        mean_spawn_raw = mean(.x$spawn_date_julian, na.rm = TRUE),
-        mean_spawn_corrected = weighted.mean(
-          .x$spawn_date_julian,
-          w = W,
-          na.rm = TRUE
-        )
-      )
-    }
-  ) |>
-  ungroup()
-
-# Validation plot: Wales corrected means should be flat near mu_wales
-method1_results |>
-  filter(country == "Wales") |>
-  tidyr::pivot_longer(
-    c(mean_spawn_raw, mean_spawn_corrected),
-    names_to = "type",
-    values_to = "mean_spawn"
-  ) |>
-  ggplot(aes(x = survey_day, y = mean_spawn, colour = type)) +
-  geom_point() +
-  geom_line() +
-  geom_hline(yintercept = mu_wales, linetype = "dashed") +
-  labs(
-    title = "Method 1 validation (Wales): corrected means should flatten to dashed line",
-    x = "Survey day of year",
-    y = "Mean spawn date (Julian day)"
-  ) +
-  theme_classic(base_size = 14)
-
-
 # ── Method 2: LOQ / Left-truncated Normal MLE ───────────────────────────
 # The LOQ (Limit of Quantification) is the *minimum detectable spawn date*
 # for a given survey.  For a survey on day D with median PLD days of larval
@@ -337,64 +243,6 @@ method2_results <- spawning_data |>
     .groups = "drop"
   )
 
-
-# ── Method 3: Wales-reference CDF lookup ────────────────────────────────
-# Conceptually the same as Method 2, but the distinction is in *where the
-# reference parameters come from*:
-#
-#   Method 2 — per-survey MLE (fits_m2) used to derive reference; applied with
-#              the pooled Wales mu/sd
-#   Method 3 — Wales parameters are fixed directly from the pooled sample;
-#              CF is read off the CDF with no per-sample optimisation at all
-#
-# Both converge to the same formula when we use (mu_wales, sd_wales) as
-# reference — they differ if you substitute the MLE-fitted (mu_ref, sd_ref)
-# from fits_m2 (see commented-out variant below).
-#
-# This IS the "optimising CDFs" approach: fit Normal CDF to Wales ECDF once,
-# then evaluate the CDF at L(survey) to get CF for any survey date worldwide.
-
-method3_results <- method2_results |>
-  rename(CF_M3 = CF_M2, mean_spawn_corrected_M3 = mean_spawn_corrected) |>
-  select(
-    country,
-    survey_date,
-    survey_day,
-    n,
-    L,
-    CF_M3,
-    mean_spawn_raw,
-    mean_spawn_corrected = mean_spawn_corrected_M3
-  )
-
-# -- Optional variant: use the MLE-pooled (mu_ref, sd_ref) instead of raw Wales --
-# mu_ref <- weighted.mean(fits_m2$mu_hat, w = fits_m2$n)
-# sd_ref <- weighted.mean(fits_m2$sd_hat, w = fits_m2$n)
-# Then replace mu_wales / sd_wales in the alpha / mean_trunc formulas above.
-
-# Note: Methods 2 and 3 produce identical corrections in the implementation
-# above (both use mu_wales, sd_wales with L = observed minimum).  To see the
-# difference, un-comment the variant above and rerun method3_results with
-# mu_ref / sd_ref — useful if you suspect the raw Wales mean is itself biased.
-
-# ── CF as a function of survey date ─────────────────────────────────────
-# Show how the correction factor grows with survey date — later surveys need
-# larger corrections because more early-spawned fish have died.
-
-method3_results |>
-  distinct(survey_day, CF_M3, country) |>
-  ggplot(aes(x = survey_day, y = CF_M3, colour = country)) +
-  geom_point() +
-  geom_line() +
-  labs(
-    title = "Correction factor (CF) grows with survey date",
-    subtitle = "CF = 1 / P(S ≥ L | Wales distribution);  L = observed min spawn date per survey",
-    x = "Survey day of year",
-    y = "Correction factor (CF)"
-  ) +
-  theme_classic(base_size = 14)
-
-
 # ── Comparison and summary across countries ──────────────────────────────
 # Combine corrected means from all three methods and compare.
 
@@ -406,15 +254,6 @@ summary_by_country <- spawning_data |>
     .groups = "drop"
   ) |>
   left_join(
-    method1_results |>
-      group_by(country) |>
-      summarise(
-        mean_M1 = weighted.mean(mean_spawn_corrected, w = n),
-        .groups = "drop"
-      ),
-    by = "country"
-  ) |>
-  left_join(
     method2_results |>
       group_by(country) |>
       summarise(
@@ -422,17 +261,7 @@ summary_by_country <- spawning_data |>
         .groups = "drop"
       ),
     by = "country"
-  ) |>
-  left_join(
-    method3_results |>
-      group_by(country) |>
-      summarise(
-        mean_M3 = weighted.mean(mean_spawn_corrected, w = n),
-        .groups = "drop"
-      ),
-    by = "country"
   )
-
 print(summary_by_country)
 
 # Per-survey-date comparison for Wales (validation)
@@ -444,24 +273,12 @@ comparison_wales <- method2_results |>
     n,
     mean_spawn_raw,
     corrected_M2 = mean_spawn_corrected
-  ) |>
-  left_join(
-    method1_results |>
-      filter(country == "Wales") |>
-      select(survey_date, corrected_M1 = mean_spawn_corrected),
-    by = "survey_date"
-  ) |>
-  left_join(
-    method3_results |>
-      filter(country == "Wales") |>
-      select(survey_date, corrected_M3 = mean_spawn_corrected),
-    by = "survey_date"
   )
 
 # Three-method comparison plot for Wales
 comparison_wales |>
   tidyr::pivot_longer(
-    c(mean_spawn_raw, corrected_M1, corrected_M2, corrected_M3),
+    c(mean_spawn_raw, corrected_M2),
     names_to = "method",
     values_to = "mean_spawn"
   ) |>
@@ -483,19 +300,5 @@ comparison_wales |>
     x = "Survey day of year",
     y = "Mean spawn date (Julian day)",
     colour = "Method"
-  ) +
-  theme_classic(base_size = 14)
-
-# Corrected mean spawn date per country (all methods)
-method3_results |>
-  ggplot(aes(x = survey_day, y = mean_spawn_corrected, colour = country)) +
-  geom_point(aes(size = n)) +
-  geom_smooth(method = "loess", se = FALSE) +
-  geom_hline(yintercept = mu_wales, linetype = "dashed") +
-  labs(
-    title = "Method 3 corrected mean spawn date by survey date (all countries)",
-    subtitle = "Dashed = Wales reference mean",
-    x = "Survey day of year",
-    y = "Corrected mean spawn date (Julian day)"
   ) +
   theme_classic(base_size = 14)
